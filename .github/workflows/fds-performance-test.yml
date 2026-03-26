@@ -1,0 +1,238 @@
+name: Run Performance Auto-analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_id:
+        description: "BlazeMeter Test ID"
+        required: true
+        default: "15510276"
+      workspace_id:
+        description: "BlazeMeter Workspace ID"
+        required: true
+        default: "2266061"
+      project_name:
+        description: "Project Name"
+        required: true
+        default: "Waynautic-1"
+      service_name:
+        description: "Service Name"
+        required: true
+        default: "fds"
+      project_id:
+        description: "Project ID"
+        required: true
+        default: "1"
+      application_id:
+        description: "Application ID"
+        required: true
+        default: "12"
+
+jobs:
+  run-performance-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # FIX: 6 hours max — BlazeMeter test 19-20 min + processing time ke liye
+
+    env:
+      BLAZEMETER_API_KEY: ${{ secrets.BLAZEMETER_API_KEY }}
+      BLAZEMETER_API_SECRET: ${{ secrets.BLAZEMETER_API_SECRET }}
+      DJANGO_API_URL: ${{ secrets.DJANGO_API_URL }}
+      DJANGO_API_TOKEN: ${{ secrets.DJANGO_API_TOKEN }}
+      BZM_TEST_ID: ${{ inputs.test_id }}
+      WORKSPACE_ID: ${{ inputs.workspace_id }}
+      PROJECT_NAME: ${{ inputs.project_name }}
+      SERVICE_NAME: ${{ inputs.service_name }}
+      PROJECT_ID: ${{ inputs.project_id }}
+      APPLICATION_ID: ${{ inputs.application_id }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Install jq
+      run: sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Validate Inputs
+      run: |
+        if [[ -z "$BZM_TEST_ID" ]];      then echo "test_id required"; exit 1; fi
+        if [[ -z "$WORKSPACE_ID" ]];     then echo "workspace_id required"; exit 1; fi
+        if [[ -z "$PROJECT_NAME" ]];     then echo "project_name required"; exit 1; fi
+        if [[ -z "$SERVICE_NAME" ]];     then echo "service_name required"; exit 1; fi
+        if [[ -z "$PROJECT_ID" ]];       then echo "project_id required"; exit 1; fi
+        if [[ -z "$APPLICATION_ID" ]];   then echo "application_id required"; exit 1; fi
+        if [[ -z "$DJANGO_API_URL" ]];   then echo "DJANGO_API_URL not set"; exit 1; fi
+        if [[ -z "$DJANGO_API_TOKEN" ]]; then echo "DJANGO_API_TOKEN not set"; exit 1; fi
+        echo "All inputs validated. Test ID: ${BZM_TEST_ID} | Workspace: ${WORKSPACE_ID}"
+
+    # FIX: "Upload Fixed taurus.yml" step REMOVED
+    # Reason: Yeh step har baar naya test create kar raha tha (isNewTest: true)
+    # aur existing test configuration wipe ho rahi thi.
+    # Test already blazemeter_setup.py se configure ho chuka hai — yahan dobara
+    # upload karne ki zaroorat nahi.
+
+    - name: Start BlazeMeter Test
+      id: start_test
+      timeout-minutes: 10  # FIX: step-level timeout
+      run: |
+        echo "Starting test ID: ${BZM_TEST_ID}"
+
+        MASTER_ID=""
+
+        # Attempt 1: Start with workspaceId body
+        echo "--- Attempt 1: Starting test with workspaceId ---"
+        START_RESP=$(curl -s --max-time 180 --connect-timeout 60 -X POST \
+          -u "$BLAZEMETER_API_KEY:$BLAZEMETER_API_SECRET" \
+          -H "Content-Type: application/json" \
+          -d "{\"workspaceId\": ${WORKSPACE_ID}}" \
+          "https://a.blazemeter.com/api/v4/tests/${BZM_TEST_ID}/start" || echo "CURL_TIMEOUT")
+
+        echo "Start response: $START_RESP"
+
+        if [[ "$START_RESP" != "CURL_TIMEOUT" ]]; then
+          MASTER_ID=$(echo "$START_RESP" | jq -r 'if .result then .result.id else empty end' 2>/dev/null)
+          [[ -n "$MASTER_ID" && "$MASTER_ID" != "null" ]] && echo "Got master from response: $MASTER_ID"
+        else
+          echo "Start request timed out — test may have started anyway, checking masters..."
+        fi
+
+        # FIX: Masters check delay 15s → 30s (test ko start hone me time lagta hai)
+        if [[ -z "$MASTER_ID" || "$MASTER_ID" == "null" ]]; then
+          echo "--- Waiting 30s then checking masters ---"
+          sleep 30
+
+          MASTERS_RESP=$(curl -s --max-time 30 \
+            -u "$BLAZEMETER_API_KEY:$BLAZEMETER_API_SECRET" \
+            "https://a.blazemeter.com/api/v4/tests/${BZM_TEST_ID}/masters?limit=1&skip=0")
+          echo "Masters response: $MASTERS_RESP"
+
+          # FIX: null check improve kiya — .result null nahi hona chahiye
+          RESULT_CHECK=$(echo "$MASTERS_RESP" | jq -r '.result // "null"')
+          if [[ "$RESULT_CHECK" != "null" && "$RESULT_CHECK" != "[]" ]]; then
+            MASTER_ID=$(echo "$MASTERS_RESP" | jq -r '.result[0].id // empty' 2>/dev/null)
+            MASTER_STATUS=$(echo "$MASTERS_RESP" | jq -r '.result[0].status // empty' 2>/dev/null)
+            [[ -n "$MASTER_ID" && "$MASTER_ID" != "null" ]] && echo "Found master: $MASTER_ID (status: $MASTER_STATUS)"
+          else
+            echo "No masters found yet (result is null/empty) — test did not start"
+          fi
+        fi
+
+        # Attempt 2: Start without body (fallback)
+        if [[ -z "$MASTER_ID" || "$MASTER_ID" == "null" ]]; then
+          echo "--- Attempt 2: Start without body ---"
+          START_RESP2=$(curl -s --max-time 180 --connect-timeout 60 -X POST \
+            -u "$BLAZEMETER_API_KEY:$BLAZEMETER_API_SECRET" \
+            -H "Content-Type: application/json" \
+            "https://a.blazemeter.com/api/v4/tests/${BZM_TEST_ID}/start" || echo "CURL_TIMEOUT")
+          echo "Response: $START_RESP2"
+
+          if [[ "$START_RESP2" != "CURL_TIMEOUT" ]]; then
+            MASTER_ID=$(echo "$START_RESP2" | jq -r 'if .result then .result.id else empty end' 2>/dev/null)
+          fi
+
+          # Final masters check
+          if [[ -z "$MASTER_ID" || "$MASTER_ID" == "null" ]]; then
+            echo "--- Final masters check after 30s ---"
+            sleep 30
+            MASTERS_RESP2=$(curl -s --max-time 30 \
+              -u "$BLAZEMETER_API_KEY:$BLAZEMETER_API_SECRET" \
+              "https://a.blazemeter.com/api/v4/tests/${BZM_TEST_ID}/masters?limit=1&skip=0")
+            echo "Masters response: $MASTERS_RESP2"
+
+            RESULT_CHECK2=$(echo "$MASTERS_RESP2" | jq -r '.result // "null"')
+            if [[ "$RESULT_CHECK2" != "null" && "$RESULT_CHECK2" != "[]" ]]; then
+              MASTER_ID=$(echo "$MASTERS_RESP2" | jq -r '.result[0].id // empty' 2>/dev/null)
+              [[ -n "$MASTER_ID" && "$MASTER_ID" != "null" ]] && echo "Found master on final check: $MASTER_ID"
+            fi
+          fi
+        fi
+
+        if [[ -z "$MASTER_ID" || "$MASTER_ID" == "null" ]]; then
+          echo "ERROR: Test could not be started. Check BlazeMeter dashboard manually."
+          echo "Test ID: ${BZM_TEST_ID} | Workspace: ${WORKSPACE_ID}"
+          exit 1
+        fi
+
+        echo "MASTER_ID=$MASTER_ID" >> $GITHUB_ENV
+        echo "Test started! Master ID: $MASTER_ID"
+
+    - name: Poll BlazeMeter Test Status
+      timeout-minutes: 45  # FIX: poll step ke liye explicit timeout (test 19min + processing ~10min)
+      run: |
+        echo "Monitoring Master ID: ${MASTER_ID}"
+        STATUS="INIT"
+        MAX_ATTEMPTS=120  # FIX: 80 → 120 attempts = 60 minutes max polling
+        ATTEMPT=0
+
+        while [[ "$STATUS" != "ENDED" && "$STATUS" != "FAILED" && "$STATUS" != "ERROR" && "$STATUS" != "STOPPED" ]]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          if [[ $ATTEMPT -gt $MAX_ATTEMPTS ]]; then
+            echo "Timeout after 60 minutes"
+            exit 1
+          fi
+
+          sleep 30
+
+          STATUS_RESPONSE=$(curl -s --max-time 15 \
+            -u "$BLAZEMETER_API_KEY:$BLAZEMETER_API_SECRET" \
+            "https://a.blazemeter.com/api/v4/masters/${MASTER_ID}/status?level=DEBUG")
+
+          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.result.status // .result[0].status // "UNKNOWN"')
+          PROGRESS=$(echo "$STATUS_RESPONSE" | jq -r '.result.progress // .result[0].progress // 0')
+
+          ELAPSED=$((ATTEMPT * 30))
+          MINUTES=$((ELAPSED / 60))
+          echo "[${MINUTES}m] Status: $STATUS | Progress: ${PROGRESS}%"
+
+          if [[ "$STATUS" == "ERROR" || "$STATUS" == "STOPPED" || "$STATUS" == "FAILED" ]]; then
+            echo "Test failed: $STATUS"
+            exit 1
+          fi
+        done
+
+        echo "Test completed! Master ID: ${MASTER_ID}"
+
+    - name: Debug URL Check
+      run: |
+        BASE_URL="${DJANGO_API_URL%/}"
+        FULL_URL="${BASE_URL}/api/v1/autoanalysis/projects/${PROJECT_ID}/applications/${APPLICATION_ID}/executions/${MASTER_ID}/"
+        echo "Base URL: ${BASE_URL}"
+        echo "Full URL: ${FULL_URL}"
+        echo "URL char count: ${#FULL_URL}"
+        echo "Token char count: ${#DJANGO_API_TOKEN}"
+
+    - name: Trigger Performance Analyzer
+      run: |
+        echo "Triggering analysis for Master ID: ${MASTER_ID}"
+
+        BASE_URL="${DJANGO_API_URL%/}"
+        FULL_URL="${BASE_URL}/api/v1/autoanalysis/projects/${PROJECT_ID}/applications/${APPLICATION_ID}/executions/${MASTER_ID}/"
+
+        echo "Calling: ${FULL_URL}"
+
+        RESPONSE=$(curl -v -s -w "\nHTTP_STATUS:%{http_code}" --max-time 60 -X POST \
+          "${FULL_URL}" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${DJANGO_API_TOKEN}" \
+          -d "{\"blazemeter_execution_id\": \"${MASTER_ID}\", \"project_name\": \"${PROJECT_NAME}\", \"service_name\": \"${SERVICE_NAME}\", \"project_id\": \"${PROJECT_ID}\", \"application_id\": \"${APPLICATION_ID}\"}" 2>&1)
+
+        HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d':' -f2)
+        BODY=$(echo "$RESPONSE" | grep -v "^* \|^> \|^< \|HTTP_STATUS:")
+        echo "Response Body: $BODY"
+        echo "HTTP Code: $HTTP_CODE"
+
+        if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+          echo "Analysis triggered successfully!"
+        else
+          echo "Analysis trigger failed - HTTP $HTTP_CODE"
+          exit 1
+        fi
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "=============================="
+        echo "Test ID:      ${BZM_TEST_ID}"
+        echo "Master ID:    ${MASTER_ID:-not_started}"
+        echo "Workspace ID: ${WORKSPACE_ID}"
+        echo "Project:      ${PROJECT_NAME} / ${SERVICE_NAME}"
+        echo "=============================="
